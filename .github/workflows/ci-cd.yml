@@ -5,10 +5,57 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-jobs:
-  build-push-deploy:
-    runs-on: ubuntu-latest
+env:
+  IMAGE: ${{ secrets.YC_REGISTRY_REPO }}          # cr.yandex/<REGISTRY_ID>/devsecops
+  YC_BIN: $HOME/yandex-cloud/bin/yc
 
+jobs:
+  # ---------- 1) SAST: секреты + код ----------
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Gitleaks: поиск секретов в репозитории
+      - name: Run gitleaks (secrets scan)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --no-banner --redact --report-format sarif --report-path gitleaks-results.sarif
+
+      - name: Upload Gitleaks SARIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-results
+          path: gitleaks-results.sarif
+
+      # Semgrep: SAST по коду (JS/HTML/Dockerfile)
+      - name: Install semgrep
+        run: pipx install semgrep
+
+      - name: Semgrep scan
+        run: |
+          semgrep ci --config p/ci --config p/javascript --config p/dockerfile \
+            --sarif --output semgrep.sarif || true
+
+      - name: Upload Semgrep SARIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: semgrep.sarif
+
+      # Hadolint: линтинг Dockerfile
+      - name: Hadolint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          format: json
+          no-fail: true
+
+  # ---------- 2) Build & Push образа ----------
+  build_push:
+    needs: sast
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,7 +64,7 @@ jobs:
         run: |
           curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
           echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
-          $HOME/yandex-cloud/bin/yc --version
+          $YC_BIN --version
 
       - name: Configure YC with SA key
         env:
@@ -26,25 +73,85 @@ jobs:
           YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
         run: |
           echo "$YC_SA_KEY_JSON" > sa-key.json
-          $HOME/yandex-cloud/bin/yc config set service-account-key sa-key.json
-          $HOME/yandex-cloud/bin/yc config set cloud-id  "$YC_CLOUD_ID"
-          $HOME/yandex-cloud/bin/yc config set folder-id "$YC_FOLDER_ID"
-          $HOME/yandex-cloud/bin/yc config list
+          $YC_BIN config set service-account-key sa-key.json
+          $YC_BIN config set cloud-id  "$YC_CLOUD_ID"
+          $YC_BIN config set folder-id "$YC_FOLDER_ID"
+          $YC_BIN config list
 
       - name: Docker login to Yandex CR (IAM token)
         run: |
-          TOKEN=$($HOME/yandex-cloud/bin/yc iam create-token)
+          TOKEN=$($YC_BIN iam create-token)
           echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
 
-      - name: Build & Push
-        env:
-          IMAGE: ${{ secrets.YC_REGISTRY_REPO }}
+      - name: Build & Push image
         run: |
           docker build -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .
           docker push "$IMAGE:latest"
           docker push "$IMAGE:${{ github.sha }}"
 
-      - name: Deploy to VM
+  # ---------- 3) Image Scan (Trivy) ----------
+  image_scan:
+    needs: build_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Trivy
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget
+          wget -qO- https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb stable main | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      - name: Docker login (IAM) to pull image
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
+          echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+          TOKEN=$($HOME/yandex-cloud/bin/yc iam create-token)
+          echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
+
+      - name: Trivy image scan → SARIF
+        run: |
+          trivy image --timeout 10m --scanners vuln --format sarif -o trivy-image.sarif "$IMAGE:${{ github.sha }}" || true
+
+      - name: Upload Trivy SARIF
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-results
+          path: trivy-image.sarif
+
+  # ---------- 4) Security Gateway ----------
+  security_gateway:
+    needs: image_scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Trivy
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget
+          wget -qO- https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb stable main | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      - name: Docker login (IAM) to pull image
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
+          echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+          TOKEN=$($HOME/yandex-cloud/bin/yc iam create-token)
+          echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
+
+      # «Шлагбаум»: если есть HIGH/CRITICAL — job падает и дальше не идём
+      - name: Enforce policy (HIGH/CRITICAL block)
+        run: |
+          trivy image --timeout 10m --scanners vuln \
+            --severity HIGH,CRITICAL --exit-code 1 \
+            "$IMAGE:${{ github.sha }}"
+
+  # ---------- 5) Deploy на ВМ (HTTP/80) ----------
+  deploy:
+    needs: security_gateway
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
@@ -64,3 +171,18 @@ jobs:
             docker compose -f ~/site/docker-compose.yml pull
             docker compose -f ~/site/docker-compose.yml up -d
             docker ps
+
+  # ---------- 6) DAST (OWASP ZAP baseline) ----------
+  dast:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: ZAP Baseline scan (HTTP only)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: http://${{ secrets.VM_HOST }}/
+          rules_file_name: ''
+          cmd_options: '-m 5 -t 60'   # max 5 мин, таймаут 60 сек запроса
+      - name: Mark ZAP report
+        if: always()
+        run: echo "DAST finished (see job log for details)"
