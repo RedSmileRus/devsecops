@@ -16,17 +16,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Устанавливаем yc бинарником (без сторонних экшенов)
-      - name: Install YC CLI (static binary)
+      # Устанавливаем yc через install.sh и кладём бинарь в /usr/local/bin
+      - name: Install YC CLI
         run: |
           set -euo pipefail
-          curl -sSL \
-            https://storage.yandexcloud.net/yandexcloud-yc/release/latest/linux/amd64/yc \
-            -o /usr/local/bin/yc
-          chmod +x /usr/local/bin/yc
-          yc --version
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
+          install -m 0755 "$HOME/yandex-cloud/bin/yc" /usr/local/bin/yc
+          /usr/local/bin/yc --version
 
-      # 2) Настраиваем профиль YC ключом сервис-аккаунта
       - name: Configure YC with SA key
         env:
           YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
@@ -40,25 +37,19 @@ jobs:
           yc config set folder-id "$YC_FOLDER_ID"
           yc config list
 
-      # 3) Docker login в Container Registry через IAM-токен
       - name: Docker login to Yandex CR (IAM token)
         run: |
           set -euo pipefail
           TOKEN=$(yc iam create-token)
           echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
 
-      # 4) Собираем и пушим образ
       - name: Build & Push image
         run: |
           set -euo pipefail
-          docker build \
-            -t "$IMAGE:latest" \
-            -t "$IMAGE:${{ github.sha }}" \
-            .
+          docker build -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .
           docker push "$IMAGE:latest"
           docker push "$IMAGE:${{ github.sha }}"
 
-      # 5) Деплой на ВМ по SSH
       - name: Deploy to VM
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -81,7 +72,6 @@ jobs:
             docker compose -f ~/site/docker-compose.yml up -d
             docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}'
 
-      # 6) Простой health-check
       - name: Health check (curl)
         run: |
           set -euo pipefail
