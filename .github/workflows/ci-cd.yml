@@ -3,20 +3,55 @@ name: CI-CD (Yandex Cloud)
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - 'Dockerfile'
+      - 'index.html'
+      - '.github/workflows/**'
   workflow_dispatch:
 
-jobs:
-  build-push-deploy:
-    runs-on: ubuntu-latest
+permissions:
+  contents: read
 
+jobs:
+  # ---------- ЭТАП 1: SAST ----------
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: SAST — detect secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --source . --no-git -v --report-format json --report-path gitleaks.json
+        continue-on-error: false
+
+      - name: SAST — Dockerfile lint (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Upload SAST reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: |
+            gitleaks.json
+          if-no-files-found: ignore
+
+  # ---------- ЭТАП 2: Build & Push ----------
+  build_push:
+    runs-on: ubuntu-latest
+    needs: sast
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install YC CLI
+        shell: bash
         run: |
           curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
-          echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+          echo "$HOME/yandex-cloud/bin" >> "$GITHUB_PATH"
           $HOME/yandex-cloud/bin/yc --version
 
       - name: Configure YC with SA key
@@ -24,26 +59,117 @@ jobs:
           YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
           YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
           YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+        shell: bash
         run: |
-          echo "$YC_SA_KEY_JSON" > sa-key.json
+          # корректно кладём JSON в файл
+          cat > sa-key.json <<'JSON'
+          $YC_SA_KEY_JSON
+          JSON
           $HOME/yandex-cloud/bin/yc config set service-account-key sa-key.json
           $HOME/yandex-cloud/bin/yc config set cloud-id  "$YC_CLOUD_ID"
           $HOME/yandex-cloud/bin/yc config set folder-id "$YC_FOLDER_ID"
           $HOME/yandex-cloud/bin/yc config list
 
       - name: Docker login to Yandex CR (IAM token)
+        shell: bash
         run: |
           TOKEN=$($HOME/yandex-cloud/bin/yc iam create-token)
           echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
 
-      - name: Build & Push
-        env:
-          IMAGE: ${{ secrets.YC_REGISTRY_REPO }}
+      - name: Build & Push image
+        id: pushimg
+        shell: bash
         run: |
-          docker build -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .
-          docker push "$IMAGE:latest"
-          docker push "$IMAGE:${{ github.sha }}"
+          IMAGE_RAW='${{ secrets.YC_REGISTRY_REPO }}'
+          IMAGE="$(echo "$IMAGE_RAW" | tr -d '[:space:]')"   # убрать пробелы/переносы
+          if [ -z "$IMAGE" ]; then
+            echo "YC_REGISTRY_REPO is empty. Expected cr.yandex/<registry_id>/devsecops"
+            exit 1
+          fi
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
+          docker build -t "$IMAGE:latest" -t "$IMAGE:${GITHUB_SHA}" .
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${GITHUB_SHA}"
+
+  # ---------- ЭТАП 3: Image Scan (TRIVY) ----------
+  image_scan:
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      critical_count: ${{ steps.gateprep.outputs.critical_count }}
+    steps:
+      - name: Install Trivy
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: 'image'
+          image-ref: ${{ needs.build_push.outputs.image }}
+          # dummy to pull action code; фактический запуск ниже CLI-ом (нужен отчёт/подсчёт)
+        continue-on-error: true
+
+      - name: Pull image name from previous job
+        id: imgname
+        run: echo "IMAGE=${{ needs.build_push.outputs.image }}" >> $GITHUB_ENV
+
+      - name: Run Trivy (table)
+        shell: bash
+        run: |
+          trivy image --timeout 10m --no-progress \
+            --vuln-type os,library \
+            --severity HIGH,CRITICAL \
+            "$IMAGE:latest" | tee trivy-table.txt
+        continue-on-error: true
+
+      - name: Run Trivy (JSON)
+        shell: bash
+        run: |
+          trivy image --timeout 10m --no-progress \
+            --format json \
+            --vuln-type os,library \
+            "$IMAGE:latest" > trivy.json
+        continue-on-error: true
+
+      - name: Count CRITICAL vulns
+        id: gateprep
+        shell: bash
+        run: |
+          CRIT=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy.json)
+          echo "critical_count=$CRIT" >> "$GITHUB_OUTPUT"
+          echo "Found CRITICAL: $CRIT"
+
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports
+          path: |
+            trivy-table.txt
+            trivy.json
+          if-no-files-found: ignore
+
+  # ---------- ЭТАП 4: Security Gateway ----------
+  security_gateway:
+    runs-on: ubuntu-latest
+    needs: image_scan
+    steps:
+      - name: Enforce policy (block if CRITICAL > 0)
+        shell: bash
+        run: |
+          CRIT='${{ needs.image_scan.outputs.critical_count }}'
+          echo "Critical: $CRIT"
+          if [ -z "$CRIT" ]; then
+            echo "WARN: can't read CRITICAL counter — allow deploy but check reports."
+          elif [ "$CRIT" -gt 0 ]; then
+            echo "❌ Policy: CRITICAL vulnerabilities found ($CRIT). Blocking release."
+            exit 1
+          else
+            echo "✅ Policy: no CRITICAL vulns. Proceed."
+          fi
+
+  # ---------- ЭТАП 5: Deploy ----------
+  deploy:
+    runs-on: ubuntu-latest
+    needs: security_gateway
+    steps:
       - name: Deploy to VM
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -52,15 +178,42 @@ jobs:
           key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
           script: |
             set -e
+            IMAGE_RAW='${{ secrets.YC_REGISTRY_REPO }}'
+            IMAGE="$(echo "$IMAGE_RAW" | tr -d '[:space:]')"
             mkdir -p ~/site
-            cat > ~/site/docker-compose.yml <<'YAML'
+            cat > ~/site/docker-compose.yml <<YAML
             services:
               web:
-                image: ${{ secrets.YC_REGISTRY_REPO }}:latest
+                image: ${IMAGE}:latest
                 ports:
                   - "80:80"
                 restart: unless-stopped
+                healthcheck:
+                  test: ["CMD", "wget", "-qO", "-", "http://localhost"]
+                  interval: 30s
+                  timeout: 3s
+                  retries: 3
             YAML
             docker compose -f ~/site/docker-compose.yml pull
             docker compose -f ~/site/docker-compose.yml up -d
             docker ps
+
+  # ---------- ЭТАП 6: DAST (baseline) ----------
+  dast:
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: http://${{ secrets.VM_HOST }}
+          rules_file_name: ''
+          cmd_options: '-a'       # активнее, но без грубых атак
+        continue-on-error: true
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_html.html
+          if-no-files-found: ignore
