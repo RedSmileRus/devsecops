@@ -1,0 +1,66 @@
+name: CI-CD (Yandex Cloud)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install YC CLI
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
+          echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+          yc --version
+
+      - name: Configure YC with SA key
+        env:
+          YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
+          YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
+          YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+        run: |
+          echo "$YC_SA_KEY_JSON" > sa-key.json
+          yc config set service-account-key sa-key.json
+          yc config set cloud-id  "$YC_CLOUD_ID"
+          yc config set folder-id "$YC_FOLDER_ID"
+          yc config list
+
+      - name: Docker login to Yandex CR (IAM token)
+        run: |
+          TOKEN=$(yc iam create-token)
+          echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
+
+      - name: Build & Push
+        env:
+          IMAGE: ${{ secrets.YC_REGISTRY_REPO }}
+        run: |
+          docker build -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+
+      - name: Deploy to VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            mkdir -p ~/site
+            cat > ~/site/docker-compose.yml <<'YAML'
+            services:
+              web:
+                image: ${{ secrets.YC_REGISTRY_REPO }}:latest
+                ports:
+                  - "80:80"
+                restart: unless-stopped
+            YAML
+            docker compose -f ~/site/docker-compose.yml pull
+            docker compose -f ~/site/docker-compose.yml up -d
+            docker ps
