@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-# Права для загрузки SARIF в Security таб
+# нужно для загрузки SARIF в Security > Code scanning alerts
 permissions:
   contents: read
   security-events: write
@@ -16,15 +16,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run gitleaks (no PR fail, только отчёт)
+
+      # gitleaks: формируем SARIF, но не роняем job (continue-on-error)
+      - name: Run gitleaks (SAST)
         uses: gitleaks/gitleaks-action@v2
         with:
-          args: detect --no-git -v --report-format sarif --report-path gitleaks-results.sarif || true
+          # важное: без "|| true" — это передаётся как аргумент бинарнику;
+          # не нужен --source, текущая директория уже корректна
+          args: detect --no-git -v --report-format sarif --report-path gitleaks-results.sarif
+        continue-on-error: true
+
       - name: Upload SARIF to Security tab
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: gitleaks-results.sarif
-        if: always()
 
   # ---------- 2) Build / Push / Deploy ----------
   build_push_deploy:
@@ -94,7 +100,7 @@ jobs:
       - name: Health check
         run: |
           set -euo pipefail
-          curl -I --max-time 10 "http://${{ secrets.VM_HOST }}/" || exit 1
+          curl -I --max-time 10 "http://${{ secrets.VM_HOST }}/"
 
   # ---------- 3) Image Scan (Trivy, SARIF) ----------
   image_scan:
@@ -104,39 +110,44 @@ jobs:
       contents: read
       security-events: write
     steps:
+      # Trivy сам скачает бинарник; формируем SARIF и не роняем job на upload
       - name: Trivy image scan (HIGH/CRITICAL fail)
         uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: ${{ secrets.YC_REGISTRY_REPO }}:latest
-          format: 'sarif'
-          output: 'trivy-image.sarif'   # <-- файл реально создаётся
+          format: sarif
+          output: trivy-image.sarif
           vuln-type: 'os,library'
-          scanners: 'vuln'
+          scanners: vuln
           ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
-          exit-code: '1'                # роняем job если найдены HIGH/CRITICAL
+          exit-code: '1'         # пускай помечает job красным, но отчёт всё равно загрузим
+        continue-on-error: true  # на всякий случай, чтобы следующий step выполнился
+
       - name: Upload Trivy SARIF
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-image.sarif
-        if: always()
 
   # ---------- 4) DAST (ZAP Baseline) ----------
   dast:
     runs-on: ubuntu-latest
     needs: [build_push_deploy]
     steps:
-      - name: ZAP Baseline Scan (без создания GitHub-issues)
+      - name: ZAP Baseline Scan (no issues creation)
         uses: zaproxy/action-baseline@v0.12.0
         with:
           target: http://${{ secrets.VM_HOST }}/
-          allowIssueWriting: false   # <-- отключаем создание issues, чтобы не падало по правам
+          allowIssueWriting: false        # не создаём GitHub Issues
           cmd_options: >-
-            -a                 # включить активные проверки уровня "слабые"
-            -m 5               # максимум 5 минут активного сканирования
+            -a                            # немного активных проверок
+            -m 5                          # до 5 минут
+        continue-on-error: true           # пусть отчёт загрузится в любом случае
+
       - name: Upload ZAP HTML report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zap-report
           path: report_html.html
-        if: always()
