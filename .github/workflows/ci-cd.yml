@@ -16,34 +16,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Устанавливаем yc CLI через готовый экшн
-      - name: Install YC CLI
-        uses: yc-actions/yc-install@v1
-        with:
-          version: latest
+      # 1) Устанавливаем yc бинарником (без сторонних экшенов)
+      - name: Install YC CLI (static binary)
+        run: |
+          set -euo pipefail
+          curl -sSL \
+            https://storage.yandexcloud.net/yandexcloud-yc/release/latest/linux/amd64/yc \
+            -o /usr/local/bin/yc
+          chmod +x /usr/local/bin/yc
+          yc --version
 
-      - name: Check yc binary
-        run: yc --version
-
+      # 2) Настраиваем профиль YC ключом сервис-аккаунта
       - name: Configure YC with SA key
         env:
           YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
           YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
           YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
         run: |
+          set -euo pipefail
           echo "$YC_SA_KEY_JSON" > sa-key.json
           yc config set service-account-key sa-key.json
           yc config set cloud-id  "$YC_CLOUD_ID"
           yc config set folder-id "$YC_FOLDER_ID"
           yc config list
 
+      # 3) Docker login в Container Registry через IAM-токен
       - name: Docker login to Yandex CR (IAM token)
         run: |
+          set -euo pipefail
           TOKEN=$(yc iam create-token)
           echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
 
+      # 4) Собираем и пушим образ
       - name: Build & Push image
         run: |
+          set -euo pipefail
           docker build \
             -t "$IMAGE:latest" \
             -t "$IMAGE:${{ github.sha }}" \
@@ -51,6 +58,7 @@ jobs:
           docker push "$IMAGE:latest"
           docker push "$IMAGE:${{ github.sha }}"
 
+      # 5) Деплой на ВМ по SSH
       - name: Deploy to VM
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -60,6 +68,7 @@ jobs:
           script: |
             set -euo pipefail
             mkdir -p ~/site
+            export IMAGE="${{ secrets.YC_REGISTRY_REPO }}"
             cat > ~/site/docker-compose.yml <<'YAML'
             services:
               web:
@@ -68,11 +77,12 @@ jobs:
                   - "80:80"
                 restart: unless-stopped
             YAML
-            export IMAGE="${{ secrets.YC_REGISTRY_REPO }}"
             docker compose -f ~/site/docker-compose.yml pull
             docker compose -f ~/site/docker-compose.yml up -d
             docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}'
 
+      # 6) Простой health-check
       - name: Health check (curl)
         run: |
+          set -euo pipefail
           curl -I --max-time 10 "http://${{ secrets.VM_HOST }}/" || exit 1
