@@ -10,52 +10,40 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      IMAGE: ${{ secrets.YC_REGISTRY_REPO }}           # cr.yandex/<REGISTRY_ID>/devsecops
-      YC_BIN: $HOME/yandex-cloud/bin/yc
+      IMAGE: ${{ secrets.YC_REGISTRY_REPO }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Ставим YC CLI и добавляем каталог в PATH для следующих шагов
+      # Устанавливаем yc CLI через готовый экшн
       - name: Install YC CLI
-        run: |
-          set -euo pipefail
-          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
-          echo "$HOME/yandex-cloud/bin" >> "$GITHUB_PATH"
-          ls -la "$HOME/yandex-cloud/bin"
+        uses: yc-actions/yc-install@v1
+        with:
+          version: latest
 
-      # 2) Отдельно проверяем, что yc доступен
       - name: Check yc binary
-        run: |
-          set -euo pipefail
-          "$YC_BIN" --version
+        run: yc --version
 
-      # 3) Конфигурируем yc через ключ сервисного аккаунта
       - name: Configure YC with SA key
         env:
           YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
           YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
           YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
         run: |
-          set -euo pipefail
           echo "$YC_SA_KEY_JSON" > sa-key.json
-          "$YC_BIN" config set service-account-key sa-key.json
-          "$YC_BIN" config set cloud-id  "$YC_CLOUD_ID"
-          "$YC_BIN" config set folder-id "$YC_FOLDER_ID"
-          "$YC_BIN" config list
+          yc config set service-account-key sa-key.json
+          yc config set cloud-id  "$YC_CLOUD_ID"
+          yc config set folder-id "$YC_FOLDER_ID"
+          yc config list
 
-      # 4) Логинимся в Yandex Container Registry по IAM-токену
       - name: Docker login to Yandex CR (IAM token)
         run: |
-          set -euo pipefail
-          TOKEN=$("$YC_BIN" iam create-token)
+          TOKEN=$(yc iam create-token)
           echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
 
-      # 5) Сборка и публикация образа
       - name: Build & Push image
         run: |
-          set -euo pipefail
           docker build \
             -t "$IMAGE:latest" \
             -t "$IMAGE:${{ github.sha }}" \
@@ -63,13 +51,12 @@ jobs:
           docker push "$IMAGE:latest"
           docker push "$IMAGE:${{ github.sha }}"
 
-      # 6) Деплой на ВМ (SSH-ключ из секретов)
       - name: Deploy to VM
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VM_HOST }}                 # 158.160.111.15
-          username: ${{ secrets.VM_USER }}             # ubuntu
-          key: ${{ secrets.VM_SSH_PRIVATE_KEY }}       # приватный ключ для доступа к ВМ
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
           script: |
             set -euo pipefail
             mkdir -p ~/site
@@ -81,15 +68,11 @@ jobs:
                   - "80:80"
                 restart: unless-stopped
             YAML
-            # Подставим IMAGE на стороне ВМ
             export IMAGE="${{ secrets.YC_REGISTRY_REPO }}"
             docker compose -f ~/site/docker-compose.yml pull
             docker compose -f ~/site/docker-compose.yml up -d
             docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}'
 
-      # 7) Быстрый health-check (необязательно)
       - name: Health check (curl)
         run: |
-          set -euo pipefail
-          # простой HEAD-запрос на внешнем IP ВМ
           curl -I --max-time 10 "http://${{ secrets.VM_HOST }}/" || exit 1
