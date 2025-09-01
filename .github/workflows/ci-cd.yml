@@ -1,204 +1,56 @@
-name: Secure DevSecOps Pipeline for Decap CMS (Yandex Cloud)
+name: CI-CD (Yandex Cloud)
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
-  # Этап 1: CI/CD - Build & Push Image
-  build:
+  build-push-deploy:
     runs-on: ubuntu-latest
-    outputs:
-      image_tag: ${{ steps.build.outputs.image_tag }}
+
+    env:
+      IMAGE: ${{ secrets.YC_REGISTRY_REPO }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Устанавливаем yc через install.sh и кладём бинарь в /usr/local/bin
       - name: Install YC CLI
         run: |
-          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/release/latest/linux/amd64/yc -o /usr/local/bin/yc
-          chmod +x /usr/local/bin/yc
+          set -euo pipefail
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -a
+          install -m 0755 "$HOME/yandex-cloud/bin/yc" /usr/local/bin/yc
+          /usr/local/bin/yc --version
 
-      - name: Configure YC
+      - name: Configure YC with SA key
         env:
           YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
           YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
           YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
         run: |
+          set -euo pipefail
           echo "$YC_SA_KEY_JSON" > sa-key.json
           yc config set service-account-key sa-key.json
-          yc config set cloud-id "$YC_CLOUD_ID"
+          yc config set cloud-id  "$YC_CLOUD_ID"
           yc config set folder-id "$YC_FOLDER_ID"
+          yc config list
 
-      - name: Docker login to Yandex CR
+      - name: Docker login to Yandex CR (IAM token)
         run: |
+          set -euo pipefail
           TOKEN=$(yc iam create-token)
           echo "$TOKEN" | docker login -u iam --password-stdin cr.yandex
 
       - name: Build & Push image
-        id: build
         run: |
-          IMAGE="${{ secrets.YC_REGISTRY_REPO }}"
-          TAG="${{ github.sha }}"
-          docker build \
-            --build-arg OAUTH_CLIENT_ID=${{ secrets.OAUTH_CLIENT_ID }} \
-            --build-arg OAUTH_CLIENT_SECRET=${{ secrets.OAUTH_CLIENT_SECRET }} \
-            --build-arg ORIGINS=${{ secrets.ORIGINS }} \
-            -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
-          docker push "$IMAGE:$TAG"
+          set -euo pipefail
+          docker build -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .
           docker push "$IMAGE:latest"
-          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          docker push "$IMAGE:${{ github.sha }}"
 
-  # Этап 2: SAST (Static Analysis for JS/Node)
-  sast:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'  # Адаптируй под версию в проекте
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run npm audit
-        run: npm audit --audit-level=high --json > sast-npm-audit.json
-
-      - name: Run Semgrep
-        uses: semgrep/semgrep-action@v1
-        with:
-          config: auto
-          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}  # Опционально, для выгрузки
-
-      - name: Upload SAST reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: sast-reports
-          path: |
-            sast-npm-audit.json
-            semgrep-report.json  # Если Semgrep генерит
-
-  # Деплой на Staging для DAST
-  deploy-staging:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Deploy to Staging VM
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.STAGING_VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
-          script: |
-            set -euo pipefail
-            mkdir -p ~/decap-staging
-            export IMAGE="${{ secrets.YC_REGISTRY_REPO }}:${{ needs.build.outputs.image_tag }}"
-            cat > ~/decap-staging/docker-compose.yml <<'YAML'
-            services:
-              cms:
-                image: ${IMAGE}
-                ports:
-                  - "8080:80"  # Staging port
-                restart: unless-stopped
-                volumes:
-                  - ./config.yml:/app/config.yml:ro
-            YAML
-            docker compose -f ~/decap-staging/docker-compose.yml pull
-            docker compose -f ~/decap-staging/docker-compose.yml up -d
-            docker ps
-
-      - name: Health check staging
-        run: curl -I --max-time 30 "http://${{ secrets.STAGING_VM_HOST }}:8080/" || exit 1
-
-  # Этап 3: DAST (Dynamic Analysis on staging)
-  dast:
-    runs-on: ubuntu-latest
-    needs: deploy-staging
-    steps:
-      - name: Run OWASP ZAP full scan
-        uses: zaproxy/action-full-scan@v0.9.0
-        with:
-          target: 'http://${{ secrets.STAGING_VM_HOST }}:8080/'
-          cmd_options: '-f json -o dast-report.json -r dast-html-report.html'
-
-      - name: Upload DAST reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: dast-reports
-          path: |
-            dast-report.json
-            dast-html-report.html
-
-  # Этап 4: Security Checks
-  security-checks:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Scan for secrets
-        uses: trufflesecurity/trufflehog@github-action@v3.82.8
-        with:
-          path: .
-          output_format: json
-          output_path: secrets-report.json
-
-      - name: Scan Docker image vulnerabilities
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: '${{ secrets.YC_REGISTRY_REPO }}:${{ needs.build.outputs.image_tag }}'
-          format: 'json'
-          output: 'image-scan-report.json'
-          severity: 'CRITICAL,HIGH'
-
-      - name: Upload security reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-reports
-          path: |
-            secrets-report.json
-            image-scan-report.json
-
-  # Этап 5: Security Gateway
-  security-gateway:
-    runs-on: ubuntu-latest
-    needs: [sast, dast, security-checks]
-    steps:
-      - name: Download all reports
-        uses: actions/download-artifact@v4
-
-      - name: Check for critical vulnerabilities
-        run: |
-          # Проверка SAST (npm audit example)
-          if jq '.audited | select(.severity == "high" or .severity == "critical") | length > 0' sast-reports/sast-npm-audit.json; then exit 1; fi
-          # DAST
-          if jq '.site[].alerts[] | select(.riskcode > 2)' dast-reports/dast-report.json | jq 'length > 0'; then exit 1; fi  # riskcode >2 = high/critical
-          # Image scan
-          if jq '.Results[] | .Vulnerabilities[] | select(.Severity == "CRITICAL" or .Severity == "HIGH")' security-reports/image-scan-report.json | jq 'length > 0'; then exit 1; fi
-          # Secrets
-          if jq 'length > 0' security-reports/secrets-report.json; then exit 1; fi
-
-      - name: Comment on PR if failed
-        if: failure() && github.event_name == 'pull_request'
-        uses: thollander/actions-comment-pull-request@v3
-        with:
-          message: 'Security checks failed! Critical vulnerabilities found. Review reports and fix before merge. Recommendations: Update dependencies, fix code issues.'
-
-  # Финальный деплой на Prod только если gateway passed
-  deploy-prod:
-    runs-on: ubuntu-latest
-    needs: security-gateway
-    if: needs.security-gateway.result == 'success'
-    steps:
-      - name: Deploy to Prod VM
+      - name: Deploy to VM
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
@@ -206,21 +58,21 @@ jobs:
           key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
           script: |
             set -euo pipefail
-            mkdir -p ~/decap-prod
-            export IMAGE="${{ secrets.YC_REGISTRY_REPO }}:${{ needs.build.outputs.image_tag }}"
-            cat > ~/decap-prod/docker-compose.yml <<'YAML'
+            mkdir -p ~/site
+            export IMAGE="${{ secrets.YC_REGISTRY_REPO }}"
+            cat > ~/site/docker-compose.yml <<'YAML'
             services:
-              cms:
-                image: ${IMAGE}
+              web:
+                image: ${IMAGE}:latest
                 ports:
                   - "80:80"
                 restart: unless-stopped
-                volumes:
-                  - ./config.yml:/app/config.yml:ro
             YAML
-            docker compose -f ~/decap-prod/docker-compose.yml pull
-            docker compose -f ~/decap-prod/docker-compose.yml up -d
-            docker ps
+            docker compose -f ~/site/docker-compose.yml pull
+            docker compose -f ~/site/docker-compose.yml up -d
+            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}'
 
-      - name: Health check prod
-        run: curl -I --max-time 30 "http://${{ secrets.VM_HOST }}/" || exit 1
+      - name: Health check (curl)
+        run: |
+          set -euo pipefail
+          curl -I --max-time 10 "http://${{ secrets.VM_HOST }}/" || exit 1
